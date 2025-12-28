@@ -302,7 +302,7 @@ class DemoProvider:
         import io
 
         # нормальный “баннер” 100x300
-        img = Image.new("RGB", (100, 100), (245, 120, 180))
+        img = Image.new("RGB", (100, 50), (245, 120, 180))
         d = ImageDraw.Draw(img)
         d.text((20, 20), f"image_id = {image_id}", fill=(0, 0, 0))
 
