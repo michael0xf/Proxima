@@ -296,11 +296,17 @@ class DemoProvider:
         self._messages = {m.id: m for m in messages}
 
     def get_image(self, image_id: int) -> bytes:
-        # Tiny valid 1x1 PNG for offline demo
-        import base64
-        return base64.b64decode(
-            "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMB/6Xf1n8AAAAASUVORK5CYII="
-        )
+        from PIL import Image, ImageDraw
+        import io
+
+        # нормальный “баннер” 900x300
+        img = Image.new("RGB", (900, 300), (245, 245, 245))
+        d = ImageDraw.Draw(img)
+        d.text((20, 20), f"image_id = {image_id}", fill=(0, 0, 0))
+
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return buf.getvalue()
 
     def go_to(self, message_id: int) -> None:
         # Skeleton navigation: store target id
