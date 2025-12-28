@@ -267,7 +267,7 @@ def load_messages_json() -> Any:
         {
             "id": 1,
             "image_id": 7,
-            "text": "Привет. Это текст.",
+            "text": "Hello World",
             "links": [],
             "translate": {"en": "Hi. This is text."}
         },
