@@ -243,7 +243,9 @@ def render_message(message: Message, selected_lang: Optional[str], provider: Dat
         render_links(message.links, selected_lang, provider, message.id)
 
     if message.image_id is not None:
-        st.image(provider.get_image(message.image_id), use_container_width=True)
+        img = provider.get_image(message.image_id)
+        if img:  # чтобы не рисовать пустоту
+            st.image(img, width="content")
 
     render_text_block(message, selected_lang, provider)
 
@@ -299,8 +301,8 @@ class DemoProvider:
         from PIL import Image, ImageDraw
         import io
 
-        # нормальный “баннер” 900x300
-        img = Image.new("RGB", (900, 300), (245, 245, 245))
+        # нормальный “баннер” 100x300
+        img = Image.new("RGB", (100, 100), (245, 120, 180))
         d = ImageDraw.Draw(img)
         d.text((20, 20), f"image_id = {image_id}", fill=(0, 0, 0))
 
