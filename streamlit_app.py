@@ -1,7 +1,8 @@
-# app.py
+# streamlit_app.py
 import json
 import html
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Protocol, Set
 
 import streamlit as st
@@ -29,21 +30,21 @@ class DataProvider(Protocol):
 
 
 # ---------------- JSON model ----------------
-# translate placed at the END, as requested
+# translate is placed at the END (optional / "just in case"), as requested
 
 @dataclass
 class Link:
-    id: int                                  # message_id in sqlite
-    title: str                               # native title
-    translate: Dict[str, str]                # lang -> title   (optional)
+    id: int                     # message_id in sqlite
+    title: str                  # native title
+    translate: Dict[str, str]   # lang -> title   (optional)
 
 @dataclass
 class Message:
     id: int
     image_id: Optional[int]
-    text: Optional[str]                      # native text
+    text: Optional[str]         # native text
     links: List[Link]
-    translate: Dict[str, str]                # lang -> text    (optional)
+    translate: Dict[str, str]   # lang -> text    (optional)
 
 
 # ---------------- Parsing ----------------
@@ -82,18 +83,6 @@ def _parse_links(obj: Any, ctx: str) -> List[Link]:
     return out
 
 def parse_messages(payload: Any) -> List[Message]:
-    """
-    Root JSON is a LIST:
-    [
-      {
-        "id": 1,
-        "image_id": 42,
-        "text": "native",
-        "links": [{"id": 999, "title":"...", "translate":{"en":"..."}}],
-        "translate": {"en":"..."}
-      }
-    ]
-    """
     if not isinstance(payload, list):
         raise ValueError("Root must be a JSON list: Messages[...]")
 
@@ -115,6 +104,7 @@ def parse_messages(payload: Any) -> List[Message]:
             raise ValueError(f"messages[{i}].text must be a non-empty string if provided")
 
         links = _parse_links(it.get("links"), f"messages[{i}].links")
+
         tr = _parse_lang_map(it.get("translate"), f"messages[{i}].translate")
 
         out.append(Message(
@@ -127,7 +117,7 @@ def parse_messages(payload: Any) -> List[Message]:
     return out
 
 
-# ---------------- UI helpers ----------------
+# ---------------- App state helpers ----------------
 
 def collect_available_langs(messages: List[Message]) -> List[str]:
     langs: Set[str] = set()
@@ -137,109 +127,169 @@ def collect_available_langs(messages: List[Message]) -> List[str]:
             langs.update(lk.translate.keys())
     return sorted(langs)
 
+def get_selected_lang() -> Optional[str]:
+    chosen = st.session_state.get("selected_lang", "<None>")
+    return None if chosen == "<None>" else chosen
+
+def set_selected_lang(lang: Optional[str]) -> None:
+    st.session_state["selected_lang"] = "<None>" if lang is None else lang
+
 def show_overlay_error_if_any():
     err = st.session_state.get("overlay_error")
     if err:
-        with st.container():
-            st.error(err)
-            if st.button("Ok", key="overlay_ok"):
-                st.session_state["overlay_error"] = None
-                st.rerun()
+        # “поверх экрана” в Streamlit без модалки — это обычно верхний sticky-блок.
+        # Делаем максимально заметно:
+        st.error(err)
+        if st.button("Ok", key="overlay_ok"):
+            st.session_state["overlay_error"] = None
+            st.rerun()
 
-def render_links_list(links: List[Link], selected_lang: Optional[str], provider: DataProvider, msg_id: int):
-    """
-    2.2.1: list links: title first, then all translations.
-    If selected_lang exists in link.translate => bold that translation.
-    Buttons in both "columns" lead to same action: provider.go_to(link.id).
-    """
+
+# ---------------- Rendering ----------------
+
+def _render_link_translations_inline(lk: Link, selected_lang: Optional[str]) -> None:
+    # Title already rendered as button; here render all translations.
+    if not lk.translate:
+        return
+
+    parts: List[str] = []
+    for lang in sorted(lk.translate.keys()):
+        t = lk.translate[lang]
+        label = f"{lang}: {t}"
+        esc = html.escape(label)
+        if selected_lang is not None and lang == selected_lang:
+            parts.append(f"<b>{esc}</b>")
+        else:
+            parts.append(esc)
+
+    st.markdown(
+        "<div style='margin: -6px 0 10px 12px; opacity: 0.9; font-size: 0.95em;'>"
+        + " · ".join(parts) +
+        "</div>",
+        unsafe_allow_html=True
+    )
+
+def render_links(links: List[Link], selected_lang: Optional[str], provider: DataProvider, msg_id: int) -> None:
+    # 2.2.1: list links: title button first, then all translations (selected one bold)
     for lk in links:
-        # Title as a button (go_to by id)
         if st.button(lk.title, key=f"link_btn_{msg_id}_{lk.id}"):
             provider.go_to(lk.id)
+        _render_link_translations_inline(lk, selected_lang)
 
-        if lk.translate:
-            parts = []
-            for lang in sorted(lk.translate.keys()):
-                t = lk.translate[lang]
-                label = f"{lang}: {t}"
-                if selected_lang is not None and lang == selected_lang:
-                    parts.append(f"<b>{html.escape(label)}</b>")
-                else:
-                    parts.append(html.escape(label))
-            st.markdown(
-                "<div style='margin: -6px 0 10px 12px; opacity: 0.9; font-size: 0.95em;'>"
-                + " · ".join(parts) +
-                "</div>",
-                unsafe_allow_html=True
-            )
-
-def render_message(message: Message, selected_lang: Optional[str], provider: DataProvider):
+def render_text_block(message: Message, selected_lang: Optional[str], provider: DataProvider) -> None:
     """
-    2.2: for each message output in order, skipping missing completely:
-      2.2.1 links (list)
-      2.2.2 image
-      2.2.3 text / translation editor logic
+    2.2.3:
+      - if selected_lang is None: show message.text
+      - else: 2-col block:
+          left: native text
+          right: translation OR editor+save -> provider.add_translation
     """
-    # 2.2.1 links
-    if message.links:
-        render_links_list(message.links, selected_lang, provider, message.id)
+    if not message.text:
+        return
 
-    # 2.2.2 image
-    if message.image_id is not None:
-        st.image(provider.get_image(message.image_id), use_container_width=True)
-
-    # 2.2.3 text logic
-    native_text = message.text
     if selected_lang is None:
-        # 2.2.3.1: show native text only
-        if native_text:
-            st.text(native_text)
+        st.text(message.text)
         return
 
-    # 2.2.3.2: selected lang -> show "table without header" 2 cols (original vs translation/edit)
-    if not native_text:
-        # No native text => nothing to show in this section
-        return
-
+    # 2-col “table without header”
     left, right = st.columns(2, vertical_alignment="top")
     with left:
-        st.text(native_text)
+        st.text(message.text)
 
     with right:
         existing = message.translate.get(selected_lang)
         if existing:
             st.text(existing)
-        else:
-            # editor + save
-            draft_key = f"draft_tr_{message.id}_{selected_lang}"
-            if draft_key not in st.session_state:
-                st.session_state[draft_key] = ""
+            return
 
-            st.session_state[draft_key] = st.text_area(
-                "",
-                value=st.session_state[draft_key],
-                key=f"ta_{message.id}_{selected_lang}",
-                placeholder=f"Enter translation ({selected_lang})…",
-                height=120
-            )
+        # No translation => editor + Save
+        draft_key = f"draft_tr_{message.id}_{selected_lang}"
+        if draft_key not in st.session_state:
+            st.session_state[draft_key] = ""
 
-            if st.button("Save", key=f"save_{message.id}_{selected_lang}"):
-                candidate = (st.session_state[draft_key] or "").strip()
-                if not candidate:
-                    st.session_state["overlay_error"] = "Translation is empty."
-                    st.rerun()
+        # No label: “таблица без заголовка”
+        new_val = st.text_area(
+            "",
+            value=st.session_state[draft_key],
+            key=f"ta_{message.id}_{selected_lang}",
+            placeholder=f"Enter translation ({selected_lang})…",
+            height=110
+        )
+        st.session_state[draft_key] = new_val
 
-                err = provider.add_translation(message.id, selected_lang, candidate)
-                if err is None:
-                    # success -> update UI as if translation exists
-                    message.translate[selected_lang] = candidate
-                    st.rerun()
-                else:
-                    st.session_state["overlay_error"] = err
-                    st.rerun()
+        if st.button("Save", key=f"save_{message.id}_{selected_lang}"):
+            candidate = (st.session_state[draft_key] or "").strip()
+            if not candidate:
+                st.session_state["overlay_error"] = "Translation is empty."
+                st.rerun()
+
+            err = provider.add_translation(message.id, selected_lang, candidate)
+            if err is None:
+                # Update UI “as if saved” (and usually you’d persist in SQLite inside provider)
+                message.translate[selected_lang] = candidate
+                st.rerun()
+            else:
+                st.session_state["overlay_error"] = err
+                st.rerun()
+
+def render_message(message: Message, selected_lang: Optional[str], provider: DataProvider) -> None:
+    """
+    2.2: for each message output in order, skipping missing with no empty lines:
+      2.2.1 links
+      2.2.2 image
+      2.2.3 text block logic
+    """
+    if message.links:
+        render_links(message.links, selected_lang, provider, message.id)
+
+    if message.image_id is not None:
+        st.image(provider.get_image(message.image_id), use_container_width=True)
+
+    render_text_block(message, selected_lang, provider)
 
 
-# ---------------- Demo provider ----------------
+# ---------------- Data loading ----------------
+
+def load_messages_json() -> Any:
+    """
+    Real-ish skeleton:
+      - if messages.json exists рядом с app -> грузим его
+      - иначе demo payload
+    """
+    p = Path("messages.json")
+    if p.exists():
+        return json.loads(p.read_text(encoding="utf-8"))
+
+    # demo fallback
+    return [
+        {
+            "id": 1,
+            "image_id": 7,
+            "text": "Привет. Это текст.",
+            "links": [],
+            "translate": {"en": "Hi. This is text."}
+        },
+        {
+            "id": 2,
+            "image_id": None,
+            "text": "Переходы:",
+            "links": [
+                {"id": 1001, "title": "Ветвь Альфа", "translate": {"en": "Branch Alpha", "es": "Rama Alfa"}},
+                {"id": 1002, "title": "Ветвь Бета", "translate": {"en": "Branch Beta"}}
+            ],
+            "translate": {"en": "Links:"}
+        },
+        {
+            "id": 3,
+            "image_id": None,
+            "text": "Тут перевода нет, попробуй добавить:",
+            "links": [],
+            "translate": {}
+        }
+    ]
+
+
+# ---------------- Demo Provider (works without SQLite) ----------------
 
 class DemoProvider:
     def __init__(self, messages: List[Message]):
@@ -253,20 +303,20 @@ class DemoProvider:
         )
 
     def go_to(self, message_id: int) -> None:
-        # Just store target; real app can scroll/jump/load branch/etc.
+        # Skeleton navigation: store target id
         st.session_state["goto_message_id"] = message_id
         st.query_params["goto"] = str(message_id)
         st.rerun()
 
     def add_translation(self, message_id: int, lang: str, translation: str) -> Optional[str]:
-        # Demo "DB write" simulation
-        # Return string on error to demonstrate overlay
-        if len(translation) > 5000:
+        # Demo “save”: validate a bit and store in-memory
+        if len(lang) > 32:
+            return "Language code is too long."
+        if len(translation) > 10_000:
             return "Translation is too long."
         msg = self._messages.get(message_id)
         if not msg:
             return f"Message {message_id} not found."
-        # Simulate success
         msg.translate[lang] = translation
         return None
 
@@ -274,68 +324,58 @@ class DemoProvider:
 # ---------------- App ----------------
 
 st.set_page_config(layout="wide")
+
+# No title, as requested.
 show_overlay_error_if_any()
 
-# Demo JSON input
-example = [
-    {
-        "id": 1,
-        "image_id": 7,
-        "text": "Привет. Это текст.",
-        "links": [],
-        "translate": {"en": "Hi. This is text."}
-    },
-    {
-        "id": 2,
-        "image_id": None,
-        "text": "Переходы:",
-        "links": [
-            {"id": 1001, "title": "Ветвь Альфа", "translate": {"en": "Branch Alpha", "es": "Rama Alfa"}},
-            {"id": 1002, "title": "Ветвь Бета", "translate": {"en": "Branch Beta"}}
-        ],
-        "translate": {"en": "Links:"}
-    }
-]
-
-raw = st.text_area("Messages JSON (list)", value=json.dumps(example, ensure_ascii=False, indent=2), height=240)
-
-if st.button("Render"):
-    payload = json.loads(raw)
+# Load + parse always (no Render button)
+try:
+    payload = load_messages_json()
     messages = parse_messages(payload)
+except Exception as e:
+    st.session_state["overlay_error"] = f"Bad messages.json or schema: {e}"
+    show_overlay_error_if_any()
+    st.stop()
 
-    # Keep "extra languages" only in-memory for this session (temporary dict/set)
-    st.session_state.setdefault("extra_langs", set())
+provider = DemoProvider(messages)
 
-    # --- Two-row "table" (no title, no global columns) ---
-    # Row 1: translation select + add language
-    with st.container():
-        base_langs = collect_available_langs(messages)
-        all_langs = ["<None>"] + sorted(set(base_langs) | set(st.session_state["extra_langs"]))
+# Session state defaults
+st.session_state.setdefault("extra_langs", set())      # languages added manually (in-memory)
+st.session_state.setdefault("adding_lang", False)
+st.session_state.setdefault("selected_lang", "<None>")
 
-        # default is <None>
-        current = st.session_state.get("selected_lang", "<None>")
-        if current not in all_langs:
-            current = "<None>"
-            st.session_state["selected_lang"] = current
+# ---------------- "Two-row table" ----------------
+# Row 1: translation selector + add language (inline)
+with st.container():
+    base_langs = collect_available_langs(messages)
+    all_langs = ["<None>"] + sorted(set(base_langs) | set(st.session_state["extra_langs"]))
 
-        c1, c2, c3, c4 = st.columns([3, 2, 2, 5], vertical_alignment="center")
+    current = st.session_state.get("selected_lang", "<None>")
+    if current not in all_langs:
+        current = "<None>"
+        st.session_state["selected_lang"] = current
 
-        with c1:
-            selected = st.selectbox(
-                "Translation",
-                options=all_langs,
-                index=all_langs.index(current),
-                key="translation_select"
-            )
-            st.session_state["selected_lang"] = selected
+    # (We use columns only to keep controls on one line. No global two-column layout.)
+    c1, c2, c3 = st.columns([3, 2, 5], vertical_alignment="center")
 
-        with c2:
-            if st.button("Add language", key="add_lang_btn"):
-                st.session_state["adding_lang"] = True
+    with c1:
+        selected = st.selectbox(
+            "Translation",
+            options=all_langs,
+            index=all_langs.index(current),
+            key="translation_select"
+        )
+        st.session_state["selected_lang"] = selected
 
-        with c3:
-            if st.session_state.get("adding_lang"):
-                new_lang = st.text_input("Lang", key="new_lang_input", placeholder="e.g. es")
+    with c2:
+        if st.button("Add language", key="add_lang_btn"):
+            st.session_state["adding_lang"] = True
+
+    with c3:
+        if st.session_state.get("adding_lang"):
+            new_lang = st.text_input("Lang", key="new_lang_input", placeholder="e.g. es")
+            s1, s2 = st.columns([1, 1], vertical_alignment="center")
+            with s1:
                 if st.button("Save language", key="save_lang_btn"):
                     nl = (new_lang or "").strip()
                     if not nl:
@@ -345,20 +385,19 @@ if st.button("Render"):
                     st.session_state["selected_lang"] = nl
                     st.session_state["adding_lang"] = False
                     st.rerun()
+            with s2:
+                if st.button("Cancel", key="cancel_lang_btn"):
+                    st.session_state["adding_lang"] = False
+                    st.rerun()
 
-        # c4 left empty intentionally (to keep row compact)
+st.markdown("<hr style='opacity:0.25'/>", unsafe_allow_html=True)
 
-    # Row 2: render messages in order
-    with st.container():
-        provider = DemoProvider(messages)
-        chosen = st.session_state.get("selected_lang", "<None>")
-        selected_lang: Optional[str] = None if chosen == "<None>" else chosen
+# Row 2: messages, in order
+selected_lang = get_selected_lang()
+for m in messages:
+    render_message(m, selected_lang, provider)
+    st.markdown("<hr style='opacity:0.20'/>", unsafe_allow_html=True)
 
-        for m in messages:
-            render_message(m, selected_lang, provider)
-            # lightweight separator
-            st.markdown("<hr style='opacity:0.25'/>", unsafe_allow_html=True)
-
-# Debug: where go_to points
+# Optional debug (you can remove)
 if "goto_message_id" in st.session_state:
     st.caption(f"goto_message_id = {st.session_state['goto_message_id']}")
